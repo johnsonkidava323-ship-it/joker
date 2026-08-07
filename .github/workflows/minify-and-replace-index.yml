@@ -1,0 +1,166 @@
+name: Build, minify and update index.html (auto)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  build-and-update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Build minified CSS and JS bundles
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p css js
+          CSS_OUT="css/bundle.min.css"
+          JS_OUT="js/bundle.min.js"
+          TMPCSS="$(mktemp)"
+          TMPJS="$(mktemp)"
+
+          echo "Collecting CSS files (in order)..."
+          css_files=(
+            "css/bootstrap.css"
+            "css/animate.css"
+            "css/flexslider.css"
+            "fonts/flaticon/font/flaticon.css"
+            "css/owl.carousel.min.css"
+            "css/owl.theme.default.min.css"
+            "css/icomoon.css"
+            "css/style.css"
+          )
+          for f in "${css_files[@]}"; do
+            if [ -f "$f" ]; then
+              echo " - adding $f"
+              cat "$f" >> "$TMPCSS"
+              echo "" >> "$TMPCSS"
+            else
+              echo " - skipping (not found): $f"
+            fi
+          done
+
+          echo "Minifying CSS to $CSS_OUT ..."
+          # minify with csso, fallback to concatenated if csso fails
+          if npx --no-install csso "$TMPCSS" --output "$CSS_OUT"; then
+            echo "CSS minified successfully"
+          else
+            echo "csso failed, writing concatenated CSS instead"
+            cp "$TMPCSS" "$CSS_OUT"
+          fi
+
+          echo "Collecting JS files (in order)..."
+          js_files=(
+            "js/jquery.min.js"
+            "js/jquery.easing.1.3.js"
+            "js/bootstrap.min.js"
+            "js/jquery.waypoints.min.js"
+            "js/jquery.flexslider-min.js"
+            "js/owl.carousel.min.js"
+            "js/jquery.countTo.js"
+            "js/main.js"
+          )
+          for f in "${js_files[@]}"; do
+            if [ -f "$f" ]; then
+              echo " - adding $f"
+              cat "$f" >> "$TMPJS"
+              # ensure statement separation
+              echo ";" >> "$TMPJS"
+            else
+              echo " - skipping (not found): $f"
+            fi
+          done
+
+          echo "Minifying JS to $JS_OUT ..."
+          if npx --no-install terser "$TMPJS" -c -m -o "$JS_OUT"; then
+            echo "JS minified successfully"
+          else
+            echo "terser failed, writing concatenated JS instead"
+            cp "$TMPJS" "$JS_OUT"
+          fi
+
+          rm -f "$TMPCSS" "$TMPJS"
+
+      - name: Modify index.html to use bundles (backup original)
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE=index.html
+          if [ ! -f "$FILE" ]; then
+            echo "index.html not found, aborting index replacement"
+            exit 0
+          fi
+
+          # backup
+          cp "$FILE" "${FILE}.bak"
+
+          # 1) Replace the head CSS block (from the Quicksand Google Fonts link up to the Modernizr script)
+          perl -0777 -pe '
+            BEGIN { $r = q{<link href="https://fonts.googleapis.com/css?family=Quicksand:300,400,500,700" rel="stylesheet">\n<link href="https://fonts.googleapis.com/css?family=Playfair+Display:400,400i,700" rel="stylesheet">\n\n<!-- INLINE CRITICAL CSS -->\n<style>html,body{height:100%;margin:0;font-family:"Quicksand",Arial,sans-serif;color:rgba(0,0,0,.85);font-size:15px;line-height:1.8}#colorlib-page{width:100%;position:relative;overflow:hidden}#colorlib-aside{width:300px;position:fixed;top:0;left:0;padding-top:3em;background:#f2f3f7;z-index:1001;overflow-y:auto}#colorlib-aside .author-img{width:150px;height:150px;margin:0 auto 30px;border-radius:50%;background-size:cover;background-position:center}#colorlib-main{margin-left:300px;transition:0.5s;padding:0 1em}@media screen and (max-width:768px){#colorlib-aside{transform:translateX(-300px)}#colorlib-main{margin-left:0}}#colorlib-hero{min-height:500px;background:#fff center center no-repeat;background-size:cover;clear:both}.slider-text-inner{vertical-align:middle;padding:2.5em}.btn{font-size:12px;text-transform:uppercase;padding:10px 15px}</style>\n\n<!-- Preload and load the full bundled CSS -->\n<link rel="preload" href="css/bundle.min.css" as="style" onload="this.rel=\'stylesheet\'">\n<noscript><link rel="stylesheet" href="css/bundle.min.css"></noscript>\n\n<!-- Modernizr JS -->\n<script src="js/modernizr-2.6.2.min.js"></script>} }
+            s#<link href="https://fonts.googleapis.com/css\?family=Quicksand:300,400,500,700".*?<script src="js/modernizr-2\.6\.2\.min\.js"></script>#$r#s;
+          ' -i "$FILE"
+
+          # 2) Replace the scripts block from the "<!-- jQuery -->" comment down to the main.js script with a single deferred bundle
+          perl -0777 -pe '
+            BEGIN { $s = q{<!-- Load single deferred JS bundle (generated by workflow) -->\n<script defer src="js/bundle.min.js"></script>\n<noscript><!-- Fallback: enable full script list in case JS disabled --></noscript>} }
+            s#<!-- jQuery -->.*?<script src="js/main.js"></script>#$s#s;
+          ' -i "$FILE"
+
+          echo "index.html updated; original saved to index.html.bak"
+
+      - name: Create branch and commit changes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          branch="opt/minify-inline-assets"
+          # Create branch if it does not exist, else checkout it
+          if git ls-remote --exit-code --heads origin "${branch}"; then
+            git fetch origin "${branch}:${branch}"
+            git checkout "${branch}"
+          else
+            git checkout -b "${branch}"
+          fi
+
+          git add css/bundle.min.css js/bundle.min.js index.html index.html.bak || true
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: add minified bundles and update index.html to use them (generated by workflow)"
+            git push -u origin "${branch}"
+          fi
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: add minified bundles and update index.html (generated by workflow)"
+          branch: opt/minify-inline-assets
+          title: "Opt: add minified CSS/JS bundles & update index.html"
+          body: |
+            This PR was automatically created by the workflow. It:
+              - adds css/bundle.min.css and js/bundle.min.js (concatenated & minified)
+              - updates index.html to inline critical CSS, preload css/bundle.min.css and load js/bundle.min.js (deferred)
+              - includes index.html.bak (original backup)
+
+            Please review the changes (especially index.html) and test functionality (sliders, counters, nav).
+          labels: automation
+          base: main
